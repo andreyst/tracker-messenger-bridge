@@ -2,7 +2,6 @@ package bot
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -29,14 +28,18 @@ type Bot struct {
 	TelegramChatID int64
 	UserName       string
 
-	UpdateHandlers  []UpdateHandler
-	WebhookHandlers []WebhookHandler
-
 	TelegramClient *tgbotapi.BotAPI
 	GithubClient   *github.Client
 
+	EventsChan chan interface{}
+
+	Pollers  map[string]Poller
+	Webhooks map[string]Webhook
+
+	EventHandlers []EventHandler
+
 	CommentsMap map[int64]int64
-	MessagesMap map[int64]IssueOrComment
+	MessagesMap map[int64]interface{}
 
 	Mutex            sync.Mutex
 	TelegramReplacer *strings.Replacer
@@ -67,20 +70,19 @@ type Comment struct {
 	Body        string
 }
 
-// IssueOrComment - issue or comment
-type IssueOrComment struct {
-	Issue   *Issue
-	Comment *Comment
+// Poller - Poller handler
+type Poller interface {
+	Start(bot *Bot)
 }
 
-// UpdateHandler - Telegram Bot command handler
-type UpdateHandler interface {
-	Handle(bot *Bot, update tgbotapi.Update) bool
-}
-
-// WebhookHandler - Webhook handler
-type WebhookHandler interface {
+// Webhook - Webhook handler
+type Webhook interface {
 	Handle(bot *Bot, w http.ResponseWriter, r *http.Request)
+}
+
+// EventHandler - event handler
+type EventHandler interface {
+	Handle(bot *Bot, event interface{}) bool
 }
 
 // NewBot - Creates and initializes new Bot instance
@@ -89,8 +91,10 @@ func NewBot() (*Bot, error) {
 	b := &Bot{
 		TelegramChatID: chatID,
 
+		EventsChan: make(chan interface{}),
+
 		CommentsMap: make(map[int64]int64),
-		MessagesMap: make(map[int64]IssueOrComment),
+		MessagesMap: make(map[int64]interface{}),
 	}
 
 	b.TelegramReplacer = strings.NewReplacer(
@@ -169,64 +173,73 @@ func (b *Bot) initGithubClient() error {
 }
 
 // Start - start processing updates
-func (b *Bot) Start() (bool, error) {
+func (b *Bot) Start() {
 
-	http.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
-		for _, handler := range b.WebhookHandlers {
-			handler.Handle(b, w, r)
+	b.startPollers()
+	b.startWebhooks()
+
+	for event := range b.EventsChan {
+		handled := false
+		for _, updateHandler := range b.EventHandlers {
+			handled = handled || updateHandler.Handle(b, event)
 		}
-	})
+	}
 
+}
+
+func (b *Bot) startPollers() error {
+	for _, poller := range b.Pollers {
+		go poller.Start(b)
+	}
+
+	return nil
+}
+
+func (b *Bot) startWebhooks() error {
+	for path, webhook := range b.Webhooks {
+		http.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
+			webhook.Handle(b, w, r)
+		})
+	}
+
+	port, err := initPort()
+	if err != nil {
+		log.Fatalf("Unable to init webhook port: %v\n", err)
+		return err
+	}
+
+	go http.ListenAndServe(fmt.Sprintf(":%d", port), nil)
+
+	return nil
+}
+
+func initPort() (int, error) {
 	portStr := os.Getenv("PORT")
 	if portStr == "" {
 		log.Fatalf("Missing PORT env variable")
-		return false, errors.New("Missing PORT env variable")
+		return 0, errors.New("Missing PORT env variable")
 	}
 
 	port, err := strconv.Atoi(portStr)
 	if err != nil {
 		log.Fatalf("Incorrect PORT value (expected int): %v\n", err)
-		return false, err
+		return 0, err
 	}
 
-	go http.ListenAndServe(fmt.Sprintf(":%d", port), nil)
-
-	updatesChannel, err := b.startUpdates()
-	if err != nil {
-		log.Fatalf("Unable to get updates channel: %v\n", err)
-		return false, err
-	}
-
-	b.processUpdates(updatesChannel)
-	return true, nil
+	return port, nil
 }
 
-// AddUpdateHandler - add an update handler
-func (b *Bot) AddUpdateHandler(handler UpdateHandler) {
-	b.UpdateHandlers = append(b.UpdateHandlers, handler)
+// AddPoller - add a poller
+func (b *Bot) AddPoller(path string, poller Poller) {
+	b.Pollers[path] = poller
 }
 
-// AddWebhookHandler - add a webhook handler
-func (b *Bot) AddWebhookHandler(handler WebhookHandler) {
-	b.WebhookHandlers = append(b.WebhookHandlers, handler)
+// AddWebhook - add a webhook
+func (b *Bot) AddWebhook(path string, webhook Webhook) {
+	b.Webhooks[path] = webhook
 }
 
-func (b *Bot) startUpdates() (tgbotapi.UpdatesChannel, error) {
-	u := tgbotapi.NewUpdate(0)
-	u.Timeout = 60
-
-	updatesChannel, err := b.TelegramClient.GetUpdatesChan(u)
-	return updatesChannel, err
-}
-
-func (b *Bot) processUpdates(updatesChannel tgbotapi.UpdatesChannel) {
-	for update := range updatesChannel {
-		buf, _ := json.MarshalIndent(update, "", "  ")
-		fmt.Printf("Update: %v\n", string(buf))
-
-		handled := false
-		for _, updateHandler := range b.UpdateHandlers {
-			handled = handled || updateHandler.Handle(b, update)
-		}
-	}
+// AddEventHandler - add an event handler
+func (b *Bot) AddEventHandler(eventHandler EventHandler) {
+	b.EventHandlers = append(b.EventHandlers, eventHandler)
 }

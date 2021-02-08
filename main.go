@@ -5,8 +5,8 @@ import (
 	"os"
 
 	bot "github.com/andreyst/tracker-messenger-bridge/bot"
-	"github.com/andreyst/tracker-messenger-bridge/bot/updatehandlers"
-	"github.com/andreyst/tracker-messenger-bridge/bot/webhookhandlers"
+	"github.com/andreyst/tracker-messenger-bridge/bot/handlers"
+	"github.com/andreyst/tracker-messenger-bridge/bot/webhooks"
 )
 
 // Important:
@@ -25,8 +25,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	bot.AddUpdateHandler(updatehandlers.NoBumpingUpdateHandler{})
-	bot.AddUpdateHandler(updatehandlers.ReplyToCommentUpdateHandler{})
-	bot.AddWebhookHandler(webhookhandlers.GithubWebhookHandler{})
+	bot.AddWebhook("/github", webhooks.GithubWebhook{})
+
+	bot.AddEventHandler(handlers.NoBumpingEventHandler{})
+	bot.AddEventHandler(handlers.ReplyToCommentEventHandler{})
+
 	bot.Start()
 }

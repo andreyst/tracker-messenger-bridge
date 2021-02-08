@@ -1,4 +1,4 @@
-package updatehandlers
+package handlers
 
 import (
 	"context"
@@ -11,54 +11,60 @@ import (
 	"github.com/google/go-github/github"
 )
 
-// ReplyToCommentUpdateHandler - explains channel bumping policy
-type ReplyToCommentUpdateHandler struct{}
+// ReplyToCommentEventHandler - explains channel bumping policy
+type ReplyToCommentEventHandler struct{}
 
 // Handle - handles update
-func (ReplyToCommentUpdateHandler) Handle(b *bot.Bot, update tgbotapi.Update) bool {
-	fmt.Println("trying to handle")
+func (ReplyToCommentEventHandler) Handle(b *bot.Bot, event interface{}) bool {
+	update, ok := event.(tgbotapi.Update)
+	if !ok {
+		return false
+	}
+
 	if update.Message == nil {
 		return false
 	}
 
-	fmt.Println("trying to handle2")
 	if update.Message.ReplyToMessage == nil {
 		return false
 	}
 
-	b.Mutex.Lock()
 	_, isOwn := b.MessagesMap[int64(update.Message.MessageID)]
-	issueOrComment, isOwnReply := b.MessagesMap[int64(update.Message.ReplyToMessage.MessageID)]
+	source, isOwnReply := b.MessagesMap[int64(update.Message.ReplyToMessage.MessageID)]
 	fmt.Printf("isOwn: %t, isOwnReply: %t\n", isOwn, isOwnReply)
 	if isOwn || !isOwnReply {
 		// Own comment or not a reply to own comment, skipping
 		return false
 	}
-	b.Mutex.Unlock()
 
 	var issueOwner string
 	var issueRepo string
 	var issueNumber int
 	var commentBody string
 
-	if issueOrComment.Issue != nil {
-		issueOwner = issueOrComment.Issue.Owner
-		issueRepo = issueOrComment.Issue.Repo
-		issueNumber = int(issueOrComment.Issue.Number)
+	switch source.(type) {
+	case bot.Issue:
+		issue := source.(bot.Issue)
+
+		issueOwner = issue.Owner
+		issueRepo = issue.Repo
+		issueNumber = int(issue.Number)
 
 		commentBody = fmt.Sprintf("%s@ replies:\n%s",
 			update.Message.From.UserName,
 			update.Message.Text,
 		)
-	} else if issueOrComment.Comment != nil {
-		issueOwner = issueOrComment.Comment.IssueOwner
-		issueRepo = issueOrComment.Comment.IssueRepo
-		issueNumber = int(issueOrComment.Comment.IssueNumber)
+	case bot.Comment:
+		comment := source.(bot.Comment)
+
+		issueOwner = comment.IssueOwner
+		issueRepo = comment.IssueRepo
+		issueNumber = int(comment.IssueNumber)
 
 		re := regexp.MustCompile(`(?m)^(.*)$`)
 		sub := `> $1`
 		commentBody = fmt.Sprintf("%s\n\n%s@ replies:\n%s",
-			re.ReplaceAllString(issueOrComment.Comment.Body, sub),
+			re.ReplaceAllString(comment.Body, sub),
 			update.Message.From.UserName,
 			update.Message.Text,
 		)
@@ -67,13 +73,12 @@ func (ReplyToCommentUpdateHandler) Handle(b *bot.Bot, update tgbotapi.Update) bo
 	comment := &github.IssueComment{
 		Body: &commentBody,
 	}
+
 	c, _, err := b.GithubClient.Issues.CreateComment(context.Background(), issueOwner, issueRepo, issueNumber, comment)
 	if err != nil {
 		log.Fatalf("Error posting comment to issue: %v\n", err)
 	}
-	b.Mutex.Lock()
 	b.CommentsMap[*c.ID] = int64(update.Message.MessageID)
-	b.Mutex.Unlock()
 
 	return true
 }

@@ -1,4 +1,4 @@
-package updatehandlers
+package handlers
 
 import (
 	"encoding/json"
@@ -8,11 +8,16 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api"
 )
 
-// NoBumpingUpdateHandler - explains channel bumping policy
-type NoBumpingUpdateHandler struct{}
+// NoBumpingEventHandler - explains channel bumping policy
+type NoBumpingEventHandler struct{}
 
 // Handle - handles update
-func (NoBumpingUpdateHandler) Handle(bot *bot.Bot, update tgbotapi.Update) bool {
+func (NoBumpingEventHandler) Handle(bot *bot.Bot, event interface{}) bool {
+	update, ok := event.(tgbotapi.Update)
+	if !ok {
+		return false
+	}
+
 	if update.Message == nil {
 		return false
 	}
