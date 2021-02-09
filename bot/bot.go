@@ -1,9 +1,12 @@
 package bot
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
@@ -14,6 +17,11 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api"
 	"github.com/google/go-github/github"
 	"golang.org/x/oauth2"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/sqs"
+	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
 )
 
 // TODO: move path to configuration options
@@ -30,6 +38,7 @@ type Bot struct {
 
 	TelegramClient *tgbotapi.BotAPI
 	GithubClient   *github.Client
+	SqsClient      *sqs.Client
 
 	EventsChan chan interface{}
 
@@ -77,7 +86,7 @@ type Poller interface {
 
 // Webhook - Webhook handler
 type Webhook interface {
-	Handle(bot *Bot, w http.ResponseWriter, r *http.Request)
+	Handle(bot *Bot, r *http.Request)
 }
 
 // EventHandler - event handler
@@ -90,6 +99,8 @@ func NewBot() (*Bot, error) {
 	// TODO: move chatID to configuration options
 	b := &Bot{
 		TelegramChatID: chatID,
+
+		Webhooks: make(map[string]Webhook),
 
 		EventsChan: make(chan interface{}),
 
@@ -136,6 +147,12 @@ func NewBot() (*Bot, error) {
 		return nil, err
 	}
 
+	err = b.initSqsClient()
+	if err != nil {
+		log.Fatalf("Unable to init SQS client: %v\n", err)
+		return nil, err
+	}
+
 	return b, nil
 }
 
@@ -172,6 +189,18 @@ func (b *Bot) initGithubClient() error {
 	return nil
 }
 
+func (b *Bot) initSqsClient() error {
+	config, err := config.LoadDefaultConfig(context.TODO())
+	if err != nil {
+		log.Fatal(err)
+		return err
+	}
+
+	b.SqsClient = sqs.NewFromConfig(config)
+
+	return nil
+}
+
 // Start - start processing updates
 func (b *Bot) Start() {
 
@@ -196,11 +225,138 @@ func (b *Bot) startPollers() error {
 }
 
 func (b *Bot) startWebhooks() error {
-	for path, webhook := range b.Webhooks {
+	for path := range b.Webhooks {
 		http.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
-			webhook.Handle(b, w, r)
+			body, err := ioutil.ReadAll(r.Body)
+			if err != nil {
+				log.Printf("Unable to read webhook body: %v\n", err)
+				w.WriteHeader(http.StatusInternalServerError)
+				w.Write([]byte("Internal error"))
+				return
+			}
+			if len(body) == 0 {
+				w.WriteHeader(http.StatusBadRequest)
+				w.Write([]byte("Bad request"))
+				return
+			}
+			strBody := string(body)
+
+			headers, err := json.Marshal(r.Header)
+			if err != nil {
+				log.Printf("Unable to marshal headers to json: %v\n", err)
+				w.WriteHeader(http.StatusInternalServerError)
+				w.Write([]byte("Internal error"))
+				return
+			}
+
+			queueURL := os.Getenv("GITHUB_WEBHOOK_SQS_QUEUE_URL")
+			_, err = b.SqsClient.SendMessage(context.TODO(), &sqs.SendMessageInput{
+				QueueUrl:    &queueURL,
+				MessageBody: &strBody,
+				MessageAttributes: map[string]types.MessageAttributeValue{
+					"Path": {
+						DataType:    aws.String("String"),
+						StringValue: aws.String(path),
+					},
+					"Headers": {
+						DataType:    aws.String("String"),
+						StringValue: aws.String(string(headers)),
+					},
+				},
+			})
+			if err != nil {
+				log.Printf("Unable to send payload to queue: %v\n", err)
+				w.WriteHeader(http.StatusInternalServerError)
+				w.Write([]byte("Internal error"))
+				return
+			}
 		})
 	}
+
+	go func() {
+		queueURL := os.Getenv("GITHUB_WEBHOOK_SQS_QUEUE_URL")
+		messageAttributeNames := []string{
+			"Path",
+			"Headers",
+		}
+
+		for {
+			messages, err := b.SqsClient.ReceiveMessage(context.TODO(), &sqs.ReceiveMessageInput{
+				QueueUrl:              &queueURL,
+				WaitTimeSeconds:       20,
+				MaxNumberOfMessages:   10,
+				MessageAttributeNames: messageAttributeNames,
+			})
+			if err != nil {
+				log.Printf("Error receiving messages from queue: %v\n", err)
+				continue
+			}
+
+			log.Printf("Received %d messages\n", len(messages.Messages))
+			if len(messages.Messages) == 0 {
+				continue
+			}
+
+			del := []types.DeleteMessageBatchRequestEntry{}
+
+			for _, message := range messages.Messages {
+				del = append(del, types.DeleteMessageBatchRequestEntry{
+					Id:            message.MessageId,
+					ReceiptHandle: message.ReceiptHandle,
+				})
+
+				messagePathAttr, ok := message.MessageAttributes["Path"]
+				if !ok {
+					log.Printf("Skipping message, no Path attribute: %v\n", message)
+					continue
+				}
+
+				if messagePathAttr.StringValue == nil {
+					log.Printf("Nil StringValue for Path attribute for message %v\n", message.MessageId)
+				}
+
+				headersAttr, ok := message.MessageAttributes["Headers"]
+				if !ok {
+					log.Printf("Skipping message, no Headers attribute: %v\n", message)
+					continue
+				}
+
+				if headersAttr.StringValue == nil {
+					log.Printf("Nil StringValue for Headers attribute for message %v\n", message.MessageId)
+				}
+
+				var headers http.Header
+				err := json.Unmarshal([]byte(*headersAttr.StringValue), &headers)
+				if err != nil {
+					log.Printf("Unable to parse JSON headers for message ID: %v, %s\n", message.MessageId, *headersAttr.StringValue)
+				}
+
+				for path, webhook := range b.Webhooks {
+					if *messagePathAttr.StringValue == path {
+						log.Printf("Received message: %v\n", *message.Body)
+						body := ioutil.NopCloser(bytes.NewReader([]byte(*message.Body)))
+						r := &http.Request{
+							Method: "POST",
+							Body:   body,
+							Header: headers,
+						}
+
+						webhook.Handle(b, r)
+					}
+				}
+			}
+
+			res, err := b.SqsClient.DeleteMessageBatch(context.TODO(), &sqs.DeleteMessageBatchInput{
+				QueueUrl: &queueURL,
+				Entries:  del,
+			})
+			if err != nil {
+				log.Printf("Failed to delete messages: %v\n", err)
+			} else if len(res.Failed) > 0 {
+				log.Printf("Failed to delete %d messages from queue\n", len(res.Failed))
+			}
+		}
+	}()
 
 	port, err := initPort()
 	if err != nil {
@@ -208,7 +364,9 @@ func (b *Bot) startWebhooks() error {
 		return err
 	}
 
-	go http.ListenAndServe(fmt.Sprintf(":%d", port), nil)
+	addr := fmt.Sprintf(":%d", port)
+	go http.ListenAndServe(addr, nil)
+	log.Printf("Listening %s for webhooks", addr)
 
 	return nil
 }

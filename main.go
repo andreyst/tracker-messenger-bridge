@@ -7,18 +7,23 @@ import (
 	bot "github.com/andreyst/tracker-messenger-bridge/bot"
 	"github.com/andreyst/tracker-messenger-bridge/bot/handlers"
 	"github.com/andreyst/tracker-messenger-bridge/bot/webhooks"
+	"github.com/joho/godotenv"
 )
 
 // Important:
 // TODO: find user by telegram
 // TODO: persist maps
 
-// TODO: add queues for hooks
 // TODO: make error handling in hooks/updates more robust
 // TODO: redo env vars to configuration options + env vars
 // TODO: check if env vars exist
 
 func main() {
+	err := godotenv.Load()
+	if err != nil {
+		log.Fatal("Error loading .env file")
+	}
+
 	bot, err := bot.NewBot()
 	if err != nil {
 		log.Fatalf("Unable to create bot: %v\n", err)
