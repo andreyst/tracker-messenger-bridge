@@ -12,3 +12,7 @@
 ```bash
 while true; do rsync -az . root@198.199.80.196:/root/go/src/github.com/andreyst/tracker-messenger-bridge 2>/dev/null; sleep 1; done
 ```
+
+## Build
+1. `$ brew install sqlite3`
+2. 

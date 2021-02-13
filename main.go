@@ -5,14 +5,15 @@ import (
 	"os"
 
 	bot "github.com/andreyst/tracker-messenger-bridge/bot"
-	"github.com/andreyst/tracker-messenger-bridge/bot/handlers"
-	"github.com/andreyst/tracker-messenger-bridge/bot/webhooks"
+	"github.com/andreyst/tracker-messenger-bridge/handlers"
+	"github.com/andreyst/tracker-messenger-bridge/webhooks"
 	"github.com/joho/godotenv"
 )
 
 // Important:
-// TODO: find user by telegram
+// TODO: find staff user by telegram
 // TODO: persist maps
+// TODO: find out about single connection
 
 // TODO: make error handling in hooks/updates more robust
 // TODO: redo env vars to configuration options + env vars

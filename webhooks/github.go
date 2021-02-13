@@ -14,6 +14,7 @@ type GithubWebhook struct{}
 
 // Handle - handle github webhook
 func (GithubWebhook) Handle(b *bot.Bot, r *http.Request) {
+	// TODO: refactor to custom handling code without request
 	hook, _ := github.New(github.Options.Secret(os.Getenv("GITHUB_WEBHOOK_SECRET")))
 	payload, err := hook.Parse(r, github.IssuesEvent, github.IssueCommentEvent)
 	fmt.Printf("===NEW PAYLOAD:\n%v\n", payload)

@@ -3,6 +3,7 @@ package bot
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,15 +14,15 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
+	"github.com/andreyst/tracker-messenger-bridge/storage"
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api"
 	"github.com/google/go-github/github"
 	"golang.org/x/oauth2"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
-	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
 )
 
 // TODO: move path to configuration options
@@ -35,6 +36,8 @@ const (
 type Bot struct {
 	TelegramChatID int64
 	UserName       string
+
+	Storage *storage.Storage
 
 	TelegramClient *tgbotapi.BotAPI
 	GithubClient   *github.Client
@@ -107,6 +110,50 @@ func NewBot() (*Bot, error) {
 		CommentsMap: make(map[int64]int64),
 		MessagesMap: make(map[int64]interface{}),
 	}
+
+	b.Storage = storage.NewStorage(os.Getenv("DB_PATH"))
+	// storage2 := storage.NewStorage(os.Getenv("DB_PATH"))
+
+	// row := b.Storage.DB.QueryRow("SELECT is_processing FROM webhooks_data WHERE rowid=1")
+	// var isProcessing int
+	// err := row.Scan(&isProcessing)
+	// if err != nil {
+	// 	panic(err)
+	// }
+	// log.Printf("is processing: %d", isProcessing)
+
+	// go func() {
+	// 	log.Printf("Go tx 1")
+	// 	tx, err := b.Storage.DB.Begin()
+	// 	if err != nil {
+	// 		panic(err)
+	// 	}
+	// 	tx.Exec("UPDATE webhooks_data SET is_processing = 1 WHERE rowid=1")
+	// 	time.Sleep(time.Hour * 1)
+	// 	tx.Commit()
+	// }()
+
+	// time.Sleep(time.Second * 1)
+
+	// go func() {
+	// 	log.Printf("Go tx 2")
+	// 	tx, err := b.Storage.DB.Begin()
+	// 	if err != nil {
+	// 		panic(err)
+	// 	}
+	// 	row := tx.QueryRow("SELECT is_processing FROM webhooks_data WHERE rowid=1")
+	// 	var isProcessing int
+	// 	err = row.Scan(&isProcessing)
+	// 	if err != nil {
+	// 		panic(err)
+	// 	}
+	// 	log.Printf("is processing: %d", isProcessing)
+	// 	time.Sleep(time.Second * 3)
+	// 	log.Printf("Commit tx 2")
+	// 	tx.Commit()
+	// }()
+
+	// time.Sleep(time.Hour * 1)
 
 	b.TelegramReplacer = strings.NewReplacer(
 		"_", "\\_",
@@ -226,6 +273,10 @@ func (b *Bot) startPollers() error {
 
 func (b *Bot) startWebhooks() error {
 	for path := range b.Webhooks {
+		// TODO: send new messages via chan for quicker response
+		// TODO: refactor to separate webhook serber
+		// TODO: allow for responses from handler, timeout requests
+		// TODO: error handle on write errors, return 500
 		http.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
 			body, err := ioutil.ReadAll(r.Body)
 			if err != nil {
@@ -239,7 +290,6 @@ func (b *Bot) startWebhooks() error {
 				w.Write([]byte("Bad request"))
 				return
 			}
-			strBody := string(body)
 
 			headers, err := json.Marshal(r.Header)
 			if err != nil {
@@ -249,21 +299,34 @@ func (b *Bot) startWebhooks() error {
 				return
 			}
 
-			queueURL := os.Getenv("GITHUB_WEBHOOK_SQS_QUEUE_URL")
-			_, err = b.SqsClient.SendMessage(context.TODO(), &sqs.SendMessageInput{
-				QueueUrl:    &queueURL,
-				MessageBody: &strBody,
-				MessageAttributes: map[string]types.MessageAttributeValue{
-					"Path": {
-						DataType:    aws.String("String"),
-						StringValue: aws.String(path),
-					},
-					"Headers": {
-						DataType:    aws.String("String"),
-						StringValue: aws.String(string(headers)),
-					},
-				},
-			})
+			// queueURL := os.Getenv("GITHUB_WEBHOOK_SQS_QUEUE_URL")
+			// _, err = b.SqsClient.SendMessage(context.TODO(), &sqs.SendMessageInput{
+			// 	QueueUrl:    &queueURL,
+			// 	MessageBody: &strBody,
+			// 	MessageAttributes: map[string]types.MessageAttributeValue{
+			// 		"Path": {
+			// 			DataType:    aws.String("String"),
+			// 			StringValue: aws.String(path),
+			// 		},
+			// 		"Headers": {
+			// 			DataType:    aws.String("String"),
+			// 			StringValue: aws.String(string(headers)),
+			// 		},
+			// 	},
+			// })
+			b.Mutex.Lock()
+			_, err = b.Storage.DB.Exec(`
+			INSERT INTO webhooks_data(created_at, updated_at, path, headers, body, visible_at) VALUES(
+				datetime("now"),
+				datetime("now"),
+				$1,
+				$2,
+				$3,
+				datetime("now", "+30 seconds")
+			)
+			`, path, headers, body)
+			b.Mutex.Unlock()
+
 			if err != nil {
 				log.Printf("Unable to send payload to queue: %v\n", err)
 				w.WriteHeader(http.StatusInternalServerError)
@@ -274,87 +337,162 @@ func (b *Bot) startWebhooks() error {
 	}
 
 	go func() {
-		queueURL := os.Getenv("GITHUB_WEBHOOK_SQS_QUEUE_URL")
-		messageAttributeNames := []string{
-			"Path",
-			"Headers",
-		}
+		// queueURL := os.Getenv("GITHUB_WEBHOOK_SQS_QUEUE_URL")
+		// messageAttributeNames := []string{
+		// 	"Path",
+		// 	"Headers",
+		// }
 
 		for {
-			messages, err := b.SqsClient.ReceiveMessage(context.TODO(), &sqs.ReceiveMessageInput{
-				QueueUrl:              &queueURL,
-				WaitTimeSeconds:       20,
-				MaxNumberOfMessages:   10,
-				MessageAttributeNames: messageAttributeNames,
-			})
+			time.Sleep(time.Second * 3)
+
+			row := b.Storage.DB.QueryRow(`
+			SELECT rowid, path, headers, body
+			FROM webhooks_data
+			WHERE is_processing = 0 AND visible_at < datetime("now")
+			LIMIT 1
+			`)
+			if row == nil {
+				continue
+			}
+
+			var rowid int
+			var path string
+			var strHeaders string
+			var strBody string
+
+			err := row.Scan(&rowid, &path, &strHeaders, &strBody)
+			if err == sql.ErrNoRows {
+				continue
+			}
 			if err != nil {
-				log.Printf("Error receiving messages from queue: %v\n", err)
+				panic(err)
+			}
+
+			res, err := b.Storage.DB.Exec(`
+			UPDATE webhooks_data SET
+				is_processing = 1,
+				visible_at = datetime("now")
+			WHERE rowid = $1 AND is_processing = 0
+			`, rowid)
+			if err != nil {
+				panic(err)
+			}
+
+			rowsAffected, err := res.RowsAffected()
+			if err != nil {
+				panic(err)
+			}
+
+			if rowsAffected == 0 {
 				continue
 			}
 
-			log.Printf("Received %d messages\n", len(messages.Messages))
-			if len(messages.Messages) == 0 {
+			// TODO: wrap into transaction, check isolation level
+			log.Printf("Received message: %v\n", strBody)
+
+			var headers http.Header
+			err = json.Unmarshal([]byte(strHeaders), &headers)
+			if err != nil {
+				log.Printf("Unable to parse JSON headers for message ID: %v, %s\n", rowid, strHeaders)
 				continue
 			}
 
-			del := []types.DeleteMessageBatchRequestEntry{}
-
-			for _, message := range messages.Messages {
-				del = append(del, types.DeleteMessageBatchRequestEntry{
-					Id:            message.MessageId,
-					ReceiptHandle: message.ReceiptHandle,
-				})
-
-				messagePathAttr, ok := message.MessageAttributes["Path"]
-				if !ok {
-					log.Printf("Skipping message, no Path attribute: %v\n", message)
-					continue
-				}
-
-				if messagePathAttr.StringValue == nil {
-					log.Printf("Nil StringValue for Path attribute for message %v\n", message.MessageId)
-				}
-
-				headersAttr, ok := message.MessageAttributes["Headers"]
-				if !ok {
-					log.Printf("Skipping message, no Headers attribute: %v\n", message)
-					continue
-				}
-
-				if headersAttr.StringValue == nil {
-					log.Printf("Nil StringValue for Headers attribute for message %v\n", message.MessageId)
-				}
-
-				var headers http.Header
-				err := json.Unmarshal([]byte(*headersAttr.StringValue), &headers)
-				if err != nil {
-					log.Printf("Unable to parse JSON headers for message ID: %v, %s\n", message.MessageId, *headersAttr.StringValue)
-				}
-
-				for path, webhook := range b.Webhooks {
-					if *messagePathAttr.StringValue == path {
-						log.Printf("Received message: %v\n", *message.Body)
-						body := ioutil.NopCloser(bytes.NewReader([]byte(*message.Body)))
-						r := &http.Request{
-							Method: "POST",
-							Body:   body,
-							Header: headers,
-						}
-
-						webhook.Handle(b, r)
+			for webhookPath, webhook := range b.Webhooks {
+				if webhookPath == path {
+					body := ioutil.NopCloser(bytes.NewReader([]byte(strBody)))
+					r := &http.Request{
+						Method: "POST",
+						Body:   body,
+						Header: headers,
 					}
+
+					webhook.Handle(b, r)
 				}
 			}
 
-			res, err := b.SqsClient.DeleteMessageBatch(context.TODO(), &sqs.DeleteMessageBatchInput{
-				QueueUrl: &queueURL,
-				Entries:  del,
-			})
+			_, err = b.Storage.DB.Exec(`
+			DELETE FROM webhooks_data
+			WHERE rowid = $1
+			`, rowid)
 			if err != nil {
-				log.Printf("Failed to delete messages: %v\n", err)
-			} else if len(res.Failed) > 0 {
-				log.Printf("Failed to delete %d messages from queue\n", len(res.Failed))
+				panic(err)
 			}
+
+			// 	messages, err := b.SqsClient.ReceiveMessage(context.TODO(), &sqs.ReceiveMessageInput{
+			// 		QueueUrl:              &queueURL,
+			// 		WaitTimeSeconds:       20,
+			// 		MaxNumberOfMessages:   10,
+			// 		MessageAttributeNames: messageAttributeNames,
+			// 	})
+			// 	if err != nil {
+			// 		log.Printf("Error receiving messages from queue: %v\n", err)
+			// 		continue
+			// 	}
+
+			// 	log.Printf("Received %d messages\n", len(messages.Messages))
+			// 	if len(messages.Messages) == 0 {
+			// 		continue
+			// 	}
+
+			// 	del := []types.DeleteMessageBatchRequestEntry{}
+
+			// 	for _, message := range messages.Messages {
+			// 		del = append(del, types.DeleteMessageBatchRequestEntry{
+			// 			Id:            message.MessageId,
+			// 			ReceiptHandle: message.ReceiptHandle,
+			// 		})
+
+			// 		messagePathAttr, ok := message.MessageAttributes["Path"]
+			// 		if !ok {
+			// 			log.Printf("Skipping message, no Path attribute: %v\n", message)
+			// 			continue
+			// 		}
+
+			// 		if messagePathAttr.StringValue == nil {
+			// 			log.Printf("Nil StringValue for Path attribute for message %v\n", message.MessageId)
+			// 		}
+
+			// 		headersAttr, ok := message.MessageAttributes["Headers"]
+			// 		if !ok {
+			// 			log.Printf("Skipping message, no Headers attribute: %v\n", message)
+			// 			continue
+			// 		}
+
+			// 		if headersAttr.StringValue == nil {
+			// 			log.Printf("Nil StringValue for Headers attribute for message %v\n", message.MessageId)
+			// 		}
+
+			// 		var headers http.Header
+			// 		err := json.Unmarshal([]byte(*headersAttr.StringValue), &headers)
+			// 		if err != nil {
+			// 			log.Printf("Unable to parse JSON headers for message ID: %v, %s\n", message.MessageId, *headersAttr.StringValue)
+			// 		}
+
+			// 		for path, webhook := range b.Webhooks {
+			// 			if *messagePathAttr.StringValue == path {
+			// 				log.Printf("Received message: %v\n", *message.Body)
+			// 				body := ioutil.NopCloser(bytes.NewReader([]byte(*message.Body)))
+			// 				r := &http.Request{
+			// 					Method: "POST",
+			// 					Body:   body,
+			// 					Header: headers,
+			// 				}
+
+			// 				webhook.Handle(b, r)
+			// 			}
+			// 		}
+			// 	}
+
+			// 	res, err := b.SqsClient.DeleteMessageBatch(context.TODO(), &sqs.DeleteMessageBatchInput{
+			// 		QueueUrl: &queueURL,
+			// 		Entries:  del,
+			// 	})
+			// 	if err != nil {
+			// 		log.Printf("Failed to delete messages: %v\n", err)
+			// 	} else if len(res.Failed) > 0 {
+			// 		log.Printf("Failed to delete %d messages from queue\n", len(res.Failed))
+			// 	}
 		}
 	}()
 
