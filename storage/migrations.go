@@ -19,10 +19,6 @@ var migrations = []string{
 		visible_at TEXT DEFAULT '' NOT NULL
 	);
 	`,
-	// 2
-	`
-	ALTER TABLE webhooks_data ADD is_processing INTEGER DEFAULT 0 NOT NULL
-	`,
 }
 
 func applyMigrations(db *sql.DB) {

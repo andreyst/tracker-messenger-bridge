@@ -3,9 +3,6 @@ module github.com/andreyst/tracker-messenger-bridge
 go 1.13
 
 require (
-	github.com/aws/aws-sdk-go-v2 v1.1.0
-	github.com/aws/aws-sdk-go-v2/config v1.1.0
-	github.com/aws/aws-sdk-go-v2/service/sqs v1.1.0
 	github.com/go-telegram-bot-api/telegram-bot-api v4.6.4+incompatible
 	github.com/google/go-github v17.0.0+incompatible
 	github.com/google/go-querystring v1.0.0 // indirect

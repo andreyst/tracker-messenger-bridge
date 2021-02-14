@@ -1,3 +1,5 @@
 .vscode
 .env
 db.sqlite
+tracker-messenger-bridge
+tracker-messenger-bridge.session.sql
